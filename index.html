@@ -3049,11 +3049,17 @@ const Scene = (function () {
     },
     showComplete(v) {
       const e = layers['g-complete']; if (e) e.classList.toggle('on', !!v);
-      const w = layers['g-crane']; if (w && v) w.classList.add('crane-away');
+      const w = layers['g-crane'];
+      // 必须双向：只 add 不 remove 的话，竣工后推倒重来吊车会永远停在半透明
+      if (w) w.classList.toggle('crane-away', !!v);
       if (v) {
         // 竣工 = 基坑回填、测量桩与临边防护拆除，地下部分全部转入地下
         ['g-pit', 'g-basement', 'g-waterproof', 'g-raft', 'g-piles', 'g-survey', 'g-rail'].forEach(off);
       }
+    },
+    /* 推倒重来时复位吊车（showComplete(false) 也会走这里，单独留一个显式入口更直观） */
+    resetCrane() {
+      const w = layers['g-crane']; if (w) w.classList.remove('crane-away');
     },
 
     /* 竣工庆祝：三波星星 + 飘字（只在新达成时调用） */
@@ -3495,9 +3501,14 @@ const MiniGames = (function () {
     mount(host, ctx) {
       ctx.S.on('g-pit'); ctx.S.on('g-piles'); ctx.S.on('g-rig'); ctx.S.machine('');
       const PILES = 5, NEED = 12;
-      const total = PILES * 3 + 2;
-      // 每根桩锤击次数不固定（打得准 3 次、偏差 4 次），完成判定以「桩打完 + 后序工序齐」为准
-      const st = stepper(total, (n, t) => ctx.progress(Math.min(1, n / t)), () => {});
+      // 进度改用「实际完成量」计算，不能再用「锤击次数」当作固定分母：
+      // 落锤落在好的区间一把 +5（3 锤成桩），落在中间区间一把 +3（4 锤成桩），
+      // 5 根桩最多要 22 锤，而原来写死 total=PILES*3+2=17 → 进度条提前冲到 100%、桩还没打完。
+      let actsDone = 0;
+      const updProgress = () => {
+        const pilePart = Math.min(1, (pi * NEED + Math.min(dep, NEED)) / (PILES * NEED));
+        ctx.progress(pilePart * 0.85 + (actsDone / 2) * 0.15);
+      };
       let pi = 0, dep = 0, lastThree = [];
 
       const sec = h('div', 'mg-sec');
@@ -3528,7 +3539,7 @@ const MiniGames = (function () {
         if (hm) { hm.animate([{ transform: 'translateY(0)' }, { transform: 'translateY(22px)' }, { transform: 'translateY(0)' }], { duration: 260 }); }
         ctx.S.puff(452, ctx.S.L.PIT_BOTTOM - 20, '#D9CDB8');
         depBar.firstChild.style.width = Math.min(100, (dep / NEED) * 100) + '%';
-        st.hit();
+        updProgress();
         if (dep >= NEED) {
           ctx.S.showPile(pi, true);
           ctx.S.stars(window.__pileXs[pi], ctx.S.L.PIT_BOTTOM - 20);
@@ -3559,8 +3570,9 @@ const MiniGames = (function () {
           if (b.dataset.ok) return;
           b.dataset.ok = '1'; b.classList.remove('mg-todo'); b.classList.add('mg-ok');
           toast(ctx, a.tip, 'ok');
-          st.hit();
-          if ([...r2.children].every((x) => x.dataset.ok)) setTimeout(ctx.done, 400);
+          actsDone++;
+          updProgress();
+          if ([...r2.children].every((x) => x.dataset.ok)) { ctx.progress(1); setTimeout(ctx.done, 400); }
         };
         r2.appendChild(b);
       });
@@ -3972,6 +3984,9 @@ const MiniGames = (function () {
         for (let c = 0; c < COLS; c++) {
           const cell = h('div', 'mg-brick-cell');
           cell.style.left = (c * 25) + '%';
+          // 必须同时给 top：只给 left 会让 4 行砖格全部叠在墙顶同一行，
+          // 砖墙看起来只有一层、第 2~4 行永远"看不见"，砌筑过程也失去层次
+          cell.style.top = (r * 25) + '%';
           wall.appendChild(cell);
           cells[0].push(cell);
         }
@@ -3997,9 +4012,21 @@ const MiniGames = (function () {
         }
         if (row < 0) { toast(ctx, '这一列已经砌满了', 'warn'); return; }
         if (c === lastCol) {
-          toast(ctx, '通缝！上下皮砖必须错缝搭接，竖向灰缝不得对齐', 'bad');
-          ctx.S.floatText(450, ctx.S.L.GROUND - 120, '通缝！', '#FF5B5B');
-          return;
+          // 防死锁：若还有别的列能放，正常按「通缝」拦下并提示；
+          // 若只剩这一列有空位，则必须放行 —— 否则玩家永久卡死
+          // （实测：先轮流点满 1~3 列 = 12 块，第 4 列放 1 块后，第 4 列被「通缝」拦、前三列被「列满」拦，
+          //   进度永久停在 13/16，第三段 pointer-events 永不解锁，也没有任何重开入口）
+          let othersOpen = false;
+          for (let k = 0; k < COLS && !othersOpen; k++) {
+            if (k === c) continue;
+            if (cells.some((rowCells) => !rowCells[k].classList.contains('filled'))) othersOpen = true;
+          }
+          if (othersOpen) {
+            toast(ctx, '通缝！上下皮砖必须错缝搭接，竖向灰缝不得对齐', 'bad');
+            ctx.S.floatText(450, ctx.S.L.GROUND - 120, '通缝！', '#FF5B5B');
+            return;
+          }
+          toast(ctx, '只剩这一列有空位 —— 本皮不得不对缝，下一皮注意错开', 'warn');
         }
         cells[row][c].classList.add('filled');
         cells[row][c].textContent = '🧱';
@@ -4592,13 +4619,22 @@ const MiniGames = (function () {
     host.className = 'mg-host';
     body.appendChild(host);
 
+    // done 必须幂等：多数小游戏的「最后一步」既显式调了一次 ctx.done，
+    // 又会让 stepper 的 onFinish 再调一次（g5/g6/g8/g10/g11）。
+    // 不拦截的话 startQuiz 会被连调两次 → 答题弹窗重建重渲一次（可见闪烁 + quizState 被重置）。
+    let doneFired = false;
     const cu = mg.mount(host, {
       S: Scene,
       tip,
       progress: setProgress,
       done: () => {
+        if (doneFired) return;
+        doneFired = true;
         setProgress(1);
-        setTimeout(() => startQuiz(id), 700);
+        // 这个延时也必须登记进 cleanups：否则玩家在 700ms 内切关，
+        // 定时器仍会拿旧关 id 调 startQuiz → 答题弹窗的 stageId 与当前关卡错位
+        const t = setTimeout(() => startQuiz(id), 700);
+        cleanups.push(() => clearTimeout(t));
       },
     });
     if (typeof cu === 'function') cleanups.push(cu);
@@ -4610,10 +4646,11 @@ const MiniGames = (function () {
   let quizState = null;
   function startQuiz(stageId) {
     const st = STAGES[stageId - 1];
+    if (stageId !== state.stage) return;   // 防御：已切关则丢弃这次（旧关残留的延时回调）
     lq = null;
     drill = null;
     $$('.mg-revive').forEach((b) => b.remove());
-    quizState = { stageId, i: 0, right: 0, list: st.quiz };
+    quizState = { stageId, i: 0, right: 0, counted: {}, list: st.quiz };
     $('#quiz-title').innerHTML = `📋 第 ${stageId} 关 · ${st.name} —— 规范考点`;
     $('#quiz').classList.add('show');
     renderQuiz();
@@ -4664,7 +4701,16 @@ const MiniGames = (function () {
       state.right += ok ? 1 : -1;
     }
     state.answered[key] = ok;
-    quizState.right += ok ? 1 : 0;
+    // 本关成绩同样要去重：quizState.counted 记录每题是否已计入，
+    // 否则中断答题后「继续本关答题」重渲同一题再答一次，本关会出现 4/3 这种超过 100% 的正确率
+    // （全局 total/right 有 answered 去重保护，但本关的 quizState.right 原来是无条件累加）
+    if (quizState.counted[quizState.i] === undefined) {
+      quizState.counted[quizState.i] = ok;
+      if (ok) quizState.right++;
+    } else if (quizState.counted[quizState.i] !== ok) {
+      quizState.counted[quizState.i] = ok;
+      quizState.right += ok ? 1 : -1;
+    }
     if (ok) {
       delete state.wrong[key];      // 重答订正答对 → 移出错题本
       Scene.stars(450, 240);
@@ -4701,7 +4747,19 @@ const MiniGames = (function () {
     if (!quizState) return;
     // 当前题已作答（答完但没点「下一题」就关闭）→ 跳到下一题，避免重答（修复 #6：从中断处续答）
     const key = quizState.stageId + '-' + quizState.i;
-    if (state.answered[key] !== undefined && quizState.i < quizState.list.length - 1) quizState.i++;
+    if (state.answered[key] !== undefined) {
+      if (quizState.i < quizState.list.length - 1) {
+        quizState.i++;
+      } else {
+        // 最后一题已答就关闭了：没有「下一题」可跳，此时直接按已答结果收尾，
+        // 否则会把原题原样重渲一遍 → 同一题被答第二次 → 本关成绩出现 4/3
+        const s = quizState.stageId, r = quizState.right, n = quizState.list.length;
+        quizState = null;
+        $('#quiz').classList.remove('show');
+        finishStage(s, r, n);
+        return;
+      }
+    }
     $('#quiz-title').innerHTML = `📋 第 ${quizState.stageId} 关 · ${STAGES[quizState.stageId - 1].name} —— 规范考点`;
     $('#quiz').classList.add('show');
     renderQuiz();
@@ -5090,6 +5148,8 @@ const MiniGames = (function () {
     Scene.showEntranceDoor(false); Scene.facadeAux('keel', false); Scene.facadeAux('fire', false);
     Scene.setBasementStep(0);
     Scene.setRaftRebarLevel(0); Scene.showTieBars(0);
+    Scene.machine('');                       // 清掉上一局残留的机械（搅拌机/脚手架），否则空地上还站着一台
+    Scene.resetCrane();                      // 吊车在竣工时会挂 crane-away，必须复位，否则推倒重来后永远是半透明
     $$('.layer').forEach((l) => l.classList.remove('on'));
     $$('#scene #g-fence .fence-seg').forEach((s) => (s.style.opacity = '0'));
     Scene.setWater(0);
@@ -5149,19 +5209,30 @@ const MiniGames = (function () {
       tip('错题本已清空 —— 通关进度和专项课记录不受影响', 'ok');
     };
 
+    // 关闭答题弹窗的统一收尾：错题重练 / 专项课测验被中途关掉时，必须把 drill/lq 一起清掉。
+    // 否则这两个变量残留会让 revivePanel() 一直早退，玩家关掉引导卡后操作台空白、没有任何开工入口。
+    function closeQuizModal() {
+      const m = $('#quiz');
+      if (!m.classList.contains('show')) return;
+      m.classList.remove('show');
+      if (drill || lq) { drill = null; lq = null; $$('.mg-revive').forEach((x) => x.remove()); return; }
+      revivePanel();
+    }
+
     $$('.modal-close').forEach((b) => {
       b.onclick = () => {
         const m = b.closest('.modal');
+        if (m.id === 'quiz') { closeQuizModal(); return; }
         m.classList.remove('show');
-        if (m.id === 'quiz' || m.id === 'brief' || m.id === 'finish') revivePanel();
+        if (m.id === 'brief' || m.id === 'finish') revivePanel();
       };
     });
     $$('.modal').forEach((m) => {
       m.onclick = (e) => {
-        if (e.target === m) {
-          m.classList.remove('show');
-          if (m.id === 'quiz' || m.id === 'brief' || m.id === 'finish') revivePanel();
-        }
+        if (e.target !== m) return;
+        if (m.id === 'quiz') { closeQuizModal(); return; }
+        m.classList.remove('show');
+        if (m.id === 'brief' || m.id === 'finish') revivePanel();
       };
     });
     $('#manual-search').oninput = (e) => filterManual(e.target.value);
@@ -5173,8 +5244,9 @@ const MiniGames = (function () {
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') $$('.modal').forEach((m) => {
         if (m.classList.contains('show')) {
+          if (m.id === 'quiz') { closeQuizModal(); return; }
           m.classList.remove('show');
-          if (m.id === 'quiz' || m.id === 'brief' || m.id === 'finish') revivePanel();
+          if (m.id === 'brief' || m.id === 'finish') revivePanel();
         }
       });
     });
